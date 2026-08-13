@@ -1,0 +1,182 @@
+# ==========================================
+# إعدادات مشتركة لـ Airflow لتجنب تكرار الكود
+# ==========================================
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: dockerfile
+  image: project-airflow:2.9.2
+  environment:
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${DB_USER:-airflow}:${DB_PASSWORD:-airflow}@db:${DB_PORT:-5432}/${DB_NAME:-airflow}
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    - AIRFLOW__CORE__FERNET_KEY=FB1o_YUg4U8_8vsn3AB6SveSwY2I2A=
+    - AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT=300
+    - AIRFLOW__WEBSERVER__WORKERS=1
+    - AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT=300
+    - AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT=300
+    - PYTHONPATH=/opt/airflow/project
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - .:/opt/airflow/project
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - /var/run/docker.sock:/var/run/docker.sock #--------
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - data_network
+
+services:
+  # ==========================================
+  # 1. قاعدة البيانات (PostgreSQL) - مستودع Airflow
+  # ==========================================
+  db:
+    image: postgres:15
+    container_name: postgres_db
+    environment:
+      - POSTGRES_USER=${DB_USER:-airflow}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-airflow}
+      - POSTGRES_DB=${DB_NAME:-airflow}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-airflow} -d ${DB_NAME:-airflow}"]
+      interval: 5s
+      retries: 5
+    networks:
+      - data_network
+
+  # ==========================================
+  # 2. التخزين (MinIO) - الـ Data Lake
+  # ==========================================
+  minio:
+    image: minio/minio
+    container_name: minio
+    ports:
+      - "9000:9000" # منفذ API للاتصال من الأكواد
+      - "9001:9001" # منفذ واجهة المستخدم (الكونسول)
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+    command: server /data --console-address ":9001"
+    volumes:
+      - ./minio_storage:/data
+    networks:
+      - data_network
+
+  # ==========================================
+  # 3. وسيط الرسائل (Kafka) - يعتمد على KRaft (بدون Zookeeper)
+  # ==========================================
+  kafka:
+    # العودة إلى الصورة الأصلية التي تعمل. المشكلة لم تكن في الصورة بل في فحص الحالة الصحية.
+    image: apache/kafka:latest
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # العودة إلى متغيرات البيئة الصحيحة الخاصة بصورة apache/kafka
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_CLUSTER_ID=MkU3OEVBNT-EdJFR2hXQ2hQd0 # هذا السطر مهم جداً للصورة الرسمية
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+    networks:
+      - data_network
+    healthcheck:
+      # هذا هو التصحيح الحقيقي: إعطاء Kafka وقتاً كافياً للبدء قبل اعتباره فاشلاً
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ==========================================
+  # 4. تهيئة Airflow (تعمل مرة واحدة ثم تنغلق)
+  # ==========================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate && (airflow users create --username admin --firstname Airflow --lastname Admin --role Admin --email admin@example.com --password admin || true)"
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${DB_USER:-airflow}:${DB_PASSWORD:-airflow}@db:${DB_PORT:-5432}/${DB_NAME:-airflow}
+      - PYTHONPATH=/opt/airflow/project
+      - _AIRFLOW_DB_MIGRATE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=admin
+      - _AIRFLOW_WWW_USER_PASSWORD=admin
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ==========================================
+  # 5. واجهة مستخدم Airflow (Webserver)
+  # ==========================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: ["bash", "-lc", "airflow webserver --debug --workers 1 --host 0.0.0.0 --port 8080"]
+    ports:
+      - "8082:8080"
+    environment:
+      - AIRFLOWCOREPARALLELISM=1
+      - AIRFLOWCOREDAG_CONCURRENCY=1
+      - AIRFLOWCOREMAX_ACTIVE_RUNS_PER_DAG=1
+      - AIRFLOWWEBSERVERWORKERS=2
+    depends_on:
+      db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+
+  # ==========================================
+  # 6. المجدول الخاص بـ Airflow (Scheduler)
+  # ==========================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ==========================================
+  # 7. Spark Master (العقل المدبر لمعالجة البيانات)
+  # ==========================================
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+    ports:
+      - "9099:8080"  # تم التعديل: ربط بورت 9099 الخارجي بالبورت الداخلي الصحيح لسبارك وهو 8080
+      - "7077:7077"  # منفذ الاتصال الداخلي للماستر
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    volumes:
+      - ./spark_stream.py:/opt/workspace/spark_stream.py
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    environment:
+      - SPARK_MODE=worker
+    depends_on:
+      - spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+
+# ==========================================
+# الشبكات ومساحات التخزين (Volumes & Networks)
+# ==========================================
+networks:
+  data_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:

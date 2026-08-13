@@ -1,0 +1,19 @@
+# Virtual Environments
+venv/
+.env
+
+# Python Cache
+pycache/
+*.pyc
+
+# Docker volumes & logs (مهم جداً حتى لا ترفع جيجابايتات من البيانات للإنترنت)
+postgres_data/
+logs/
+.minio.sys/
+
+# Data Files (تجاهل ملفات الباركيه الضخمة التي يتم تحميلها محلياً)
+*.parquet
+*.csv
+
+# OS generated files
+.DS_Store
